@@ -1,7 +1,7 @@
 [project]
-name = "mcp-dexec"
+name = "container-mcp"
 version = "0.1.0"
-description = "Repo-local MCP tool for running commands in the simjoin container."
+description = "Shared MCP service for executing commands and applying patches in a Docker container."
 requires-python = ">=3.10"
 dependencies = [
   "mcp>=1.28.1",
@@ -13,7 +13,7 @@ test = [
 ]
 
 [project.scripts]
-mcp-dexec = "server:main"
+container-mcp = "server:main"
 
 [build-system]
 requires = ["hatchling"]

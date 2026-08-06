@@ -32,15 +32,15 @@ from patch_engine import FileOperation, PatchError, apply_update, parse_patch
 PROJECT_DIR = Path(__file__).resolve().parent
 WORKING_DIR = Path.cwd()
 RUNLOG_DIR = PROJECT_DIR.parent / "RUNLOG"
-CONTAINER = os.environ.get("MCP_DEXEC_CONTAINER", "simjoin")
+CONTAINER = os.environ.get("CONTAINER_MCP_CONTAINER", "simjoin")
 CODEX_THREAD_ID_META_KEY = "threadId"
 MANUAL_RUN_ID = "manual"
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 9943
-DEFAULT_SERVICE_NAME = "simjoin-dexec.service"
+DEFAULT_SERVICE_NAME = "simjoin-container-mcp.service"
 SERVICE_STATE_DIR = PROJECT_DIR / ".service"
-SERVICE_PID_PATH = SERVICE_STATE_DIR / "simjoin-dexec.pid"
-SERVICE_LOG_PATH = SERVICE_STATE_DIR / "simjoin-dexec.log"
+SERVICE_PID_PATH = SERVICE_STATE_DIR / "container-mcp.pid"
+SERVICE_LOG_PATH = SERVICE_STATE_DIR / "container-mcp.log"
 MAX_RETURN_CHARS = 60_000
 PROGRESS_INTERVAL_SEC = 1.0
 PROGRESS_TAIL_CHARS = 1_000
@@ -170,7 +170,7 @@ _patch_lock = asyncio.Lock()
 
 
 server = FastMCP(
-    "simjoin-dexec",
+    "container-mcp",
     instructions=(
         "Run commands inside the configured already-running container. "
         "The Codex thread id is read automatically from each MCP request's metadata; "
@@ -597,7 +597,7 @@ async def _notify_progress(
         pass
     if _LOG_LEVEL_ORDER["info"] >= _LOG_LEVEL_ORDER.get(_mcp_log_level, 1):
         try:
-            await ctx.info(message, logger_name="simjoin-dexec")
+            await ctx.info(message, logger_name="container-mcp")
         except Exception:
             pass
 
@@ -701,10 +701,10 @@ async def _execute(
 
     start = datetime.now().astimezone()
     invocation_id = secrets.token_hex(16)
-    completion_marker = f"__MCP_DEXEC_COMPLETE_{invocation_id}__="
-    pidfile = f"/tmp/mcp-dexec-{invocation_id}.pid"
+    completion_marker = f"__CONTAINER_MCP_COMPLETE_{invocation_id}__="
+    pidfile = f"/tmp/container-mcp-{invocation_id}.pid"
     guarded_command = "trap 'exit 143' TERM\n" + command
-    temp_path = Path(tempfile.mkdtemp(prefix="mcp-dexec-"))
+    temp_path = Path(tempfile.mkdtemp(prefix="container-mcp-"))
     raw_stdout_path = temp_path / "stdout.raw"
     raw_stderr_path = temp_path / "stderr.raw"
     raw_stdout_path.touch()
@@ -1161,17 +1161,17 @@ def _service_name_argument(value: str) -> str:
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the dexec stdio MCP server or execute a container command manually."
+        description="Run the container MCP server or execute a container command manually."
     )
     parser.add_argument(
         "--container",
-        default=os.environ.get("MCP_DEXEC_CONTAINER", "simjoin"),
+        default=os.environ.get("CONTAINER_MCP_CONTAINER", "simjoin"),
         type=_container_argument,
         help="Name or id of the already-running Docker container (default: simjoin).",
     )
     parser.add_argument(
         "--runlog-dir",
-        default=os.environ.get("MCP_DEXEC_RUNLOG_DIR", str(PROJECT_DIR.parent / "RUNLOG")),
+        default=os.environ.get("CONTAINER_MCP_RUNLOG_DIR", str(PROJECT_DIR.parent / "RUNLOG")),
         help="RUNLOG directory (default: monorepo RUNLOG).",
     )
     subparsers = parser.add_subparsers(dest="mode")
@@ -1226,7 +1226,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--service-name",
         default=DEFAULT_SERVICE_NAME,
         type=_service_name_argument,
-        help="systemd user unit name (default: simjoin-dexec.service).",
+        help="systemd user unit name (default: simjoin-container-mcp.service).",
     )
     install_parser.add_argument(
         "--scope",
@@ -1333,7 +1333,7 @@ def _systemd_unit(
     after = "docker.service" if scope == "system" else "default.target"
     return (
         "[Unit]\n"
-        "Description=simjoin persistent dexec MCP service\n"
+        f"Description=Persistent container MCP service for {CONTAINER}\n"
         f"After={after}\n\n"
         "[Service]\n"
         "Type=simple\n"
@@ -1486,7 +1486,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
         except (OSError, UnicodeError, ValueError) as exc:
-            print(f"mcp-dexec: error: {exc}", file=sys.stderr)
+            print(f"container-mcp: error: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
         print(result)
         raise SystemExit(_manual_exit_status(exit_code))
@@ -1504,7 +1504,7 @@ def main(argv: list[str] | None = None) -> None:
                 service_user=args.service_user,
             )
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-            print(f"mcp-dexec: service installation failed: {exc}", file=sys.stderr)
+            print(f"container-mcp: service installation failed: {exc}", file=sys.stderr)
             raise SystemExit(1) from exc
         print(f"installed and started {args.service_name}: {unit_path}")
         return
@@ -1512,24 +1512,27 @@ def main(argv: list[str] | None = None) -> None:
         try:
             pid = _start_detached_service(args.port)
         except (OSError, RuntimeError) as exc:
-            print(f"mcp-dexec: service start failed: {exc}", file=sys.stderr)
+            print(f"container-mcp: service start failed: {exc}", file=sys.stderr)
             raise SystemExit(1) from exc
-        print(f"started simjoin-dexec on {DEFAULT_HTTP_HOST}:{args.port} (pid {pid})")
+        print(
+            f"started container-mcp on {DEFAULT_HTTP_HOST}:{args.port} (pid {pid}); "
+            f"log: {SERVICE_LOG_PATH}"
+        )
         return
     if args.mode == "stop-service":
         try:
             pid = _stop_detached_service()
         except (OSError, RuntimeError) as exc:
-            print(f"mcp-dexec: service stop failed: {exc}", file=sys.stderr)
+            print(f"container-mcp: service stop failed: {exc}", file=sys.stderr)
             raise SystemExit(1) from exc
-        print(f"stopped simjoin-dexec (pid {pid})")
+        print(f"stopped container-mcp (pid {pid})")
         return
     if args.mode == "status-service":
         pid = _read_service_pid()
         if pid is None or not _service_process_matches(pid):
-            print("simjoin-dexec is not running")
+            print("container-mcp is not running")
             raise SystemExit(3)
-        print(f"simjoin-dexec is running on {DEFAULT_HTTP_HOST}:{DEFAULT_HTTP_PORT} (pid {pid})")
+        print(f"container-mcp is running on {DEFAULT_HTTP_HOST}:{DEFAULT_HTTP_PORT} (pid {pid})")
         return
     server.run("stdio")
 

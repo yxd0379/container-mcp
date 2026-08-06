@@ -13,12 +13,12 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
 
 
-SERVICE_URL = os.environ.get("MCP_DEXEC_URL", "http://127.0.0.1:9943/mcp")
+SERVICE_URL = os.environ.get("CONTAINER_MCP_URL", "http://127.0.0.1:9943/mcp")
 
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("MCP_DEXEC_LIVE") != "1",
-    reason="set MCP_DEXEC_LIVE=1 to run the simjoin integration through MCP",
+    os.environ.get("CONTAINER_MCP_LIVE") != "1",
+    reason="set CONTAINER_MCP_LIVE=1 to run the simjoin integration through MCP",
 )
 
 
@@ -41,7 +41,7 @@ async def test_streamable_http_accepts_concurrent_clients() -> None:
                     read_timeout_seconds=timedelta(seconds=15),
                 ) as session:
                     initialization = await session.initialize()
-                    assert initialization.serverInfo.name == "simjoin-dexec"
+                    assert initialization.serverInfo.name == "container-mcp"
                     tools = await session.list_tools()
                     assert {tool.name for tool in tools.tools} == {"apply_patch", "dexec"}
 
@@ -99,7 +99,7 @@ async def test_live_streamable_http_tool_supports_stdin_and_progress() -> None:
                 meta=request_meta,
             )
 
-            sentinel = f"/tmp/mcp-dexec-live-{thread_id}.sentinel"
+            sentinel = f"/tmp/container-mcp-live-{thread_id}.sentinel"
             quoted_sentinel = shlex.quote(sentinel)
             timeout_result = await session.call_tool(
                 "dexec",
@@ -121,7 +121,7 @@ async def test_live_streamable_http_tool_supports_stdin_and_progress() -> None:
                 },
                 meta=request_meta,
             )
-            cancel_sentinel = f"/tmp/mcp-dexec-live-cancel-{thread_id}.sentinel"
+            cancel_sentinel = f"/tmp/container-mcp-live-cancel-{thread_id}.sentinel"
             quoted_cancel_sentinel = shlex.quote(cancel_sentinel)
             cancel_started = asyncio.Event()
 

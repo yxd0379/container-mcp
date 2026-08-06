@@ -11,12 +11,12 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 
-SERVICE_URL = os.environ.get("MCP_DEXEC_URL", "http://127.0.0.1:9943/mcp")
+SERVICE_URL = os.environ.get("CONTAINER_MCP_URL", "http://127.0.0.1:9943/mcp")
 
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("MCP_DEXEC_LIVE") != "1",
-    reason="set MCP_DEXEC_LIVE=1 to run the container patch integration through MCP",
+    os.environ.get("CONTAINER_MCP_LIVE") != "1",
+    reason="set CONTAINER_MCP_LIVE=1 to run the container patch integration through MCP",
 )
 
 

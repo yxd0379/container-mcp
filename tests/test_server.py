@@ -258,7 +258,7 @@ def test_progress_notifications_arrive_before_final_result(
     assert all(event[2] < finished_at for event in running_logs)
     assert any("phase-one" in event[0] for event in running_logs)
     assert ctx.progress
-    assert all(event[1] == "simjoin-dexec" for event in ctx.logs)
+    assert all(event[1] == "container-mcp" for event in ctx.logs)
 
 
 def test_completion_marker_never_leaks_to_notifications(
@@ -277,7 +277,7 @@ def test_completion_marker_never_leaks_to_notifications(
     messages = [message or "" for _, message, _ in ctx.progress]
     messages.extend(message for message, _, _ in ctx.logs)
     assert messages
-    assert all("__MCP_DEXEC_COMPLETE_" not in message for message in messages)
+    assert all("__CONTAINER_MCP_COMPLETE_" not in message for message in messages)
 
 
 def test_timeout_terminates_process_and_preserves_output(
@@ -312,7 +312,7 @@ def test_natural_exit_124_is_not_misreported_as_timeout(
 
     assert "exit_code: 124" in result
     assert "timed out" not in result
-    assert "__MCP_DEXEC_COMPLETE_" not in result
+    assert "__CONTAINER_MCP_COMPLETE_" not in result
 
 
 def test_cancellation_reaps_process_and_persists_audit_log(
@@ -441,7 +441,7 @@ def test_startup_arguments_configure_container_and_runlog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(server, "WORKING_DIR", tmp_path)
-    monkeypatch.setenv("MCP_DEXEC_CONTAINER", "from-env")
+    monkeypatch.setenv("CONTAINER_MCP_CONTAINER", "from-env")
 
     defaults = server._parse_args([])
     args = server._parse_args(
@@ -462,7 +462,7 @@ def test_startup_arguments_configure_container_and_runlog(
     )
     serve_args = server._parse_args(["serve", "--port", "9943"])
     install_args = server._parse_args(
-        ["install-service", "--port", "9943", "--service-name", "custom-dexec"]
+        ["install-service", "--port", "9943", "--service-name", "custom-container"]
     )
 
     assert defaults.container == "from-env"
@@ -483,7 +483,7 @@ def test_startup_arguments_configure_container_and_runlog(
     assert serve_args.port == 9943
     assert install_args.mode == "install-service"
     assert install_args.port == 9943
-    assert install_args.service_name == "custom-dexec.service"
+    assert install_args.service_name == "custom-container.service"
     assert install_args.scope == "user"
 
     with pytest.raises(SystemExit):
@@ -522,7 +522,7 @@ def test_systemd_unit_uses_current_python_and_central_runlog(
 ) -> None:
     monkeypatch.setattr(server, "RUNLOG_DIR", tmp_path / "central-runlog")
 
-    unit = server._systemd_unit(service_name="simjoin-dexec.service", port=9943)
+    unit = server._systemd_unit(service_name="simjoin-container-mcp.service", port=9943)
 
     assert "Type=simple" in unit
     assert f'ExecStart="{Path(sys.executable)}"' in unit
@@ -531,7 +531,7 @@ def test_systemd_unit_uses_current_python_and_central_runlog(
     assert "Restart=on-failure" in unit
 
     system_unit = server._systemd_unit(
-        service_name="simjoin-dexec.service",
+        service_name="simjoin-container-mcp.service",
         port=9943,
         scope="system",
         service_user="yuxd",
@@ -655,14 +655,15 @@ def test_project_configs_use_shared_http_service_and_central_runlog() -> None:
     assert (repo_root / "RUNLOG").is_dir()
     assert not (repo_root / "wiki").exists()
     assert not (repo_root / "scripts").exists()
-    assert not (repo_root / "mcp_dexec" / ".codex").exists()
-    assert not (repo_root / "mcp_dexec" / "RUNLOG").exists()
+    assert not (repo_root / "container_mcp" / ".codex").exists()
+    assert not (repo_root / "container_mcp" / "RUNLOG").exists()
     for project_name in project_names:
         project_root = repo_root / "projects" / project_name
         assert not (project_root / "RUNLOG").exists()
         assert all((project_root / name).is_dir() for name in ("wiki", "notes", "scripts"))
     for config_path in config_paths:
         config_text = config_path.read_text(encoding="utf-8")
+        assert "[mcp_servers.container]" in config_text
         assert 'url = "http://127.0.0.1:9943/mcp"' in config_text
         assert "required =" not in config_text
         assert 'command = "uv"' not in config_text
@@ -675,7 +676,7 @@ def test_project_configs_use_shared_http_service_and_central_runlog() -> None:
     active_files = [
         *config_paths,
         repo_root / "AGENTS.md",
-        repo_root / "mcp_dexec" / "readme.md",
+        repo_root / "container_mcp" / "readme.md",
     ]
     legacy_repo = "play-feature" + "_retrieve"
     assert all(legacy_repo not in path.read_text(encoding="utf-8") for path in active_files)

@@ -1,4 +1,4 @@
-# dexec 实现说明
+# container-mcp 实现说明
 
 ## MCP 工具与线程关联
 
@@ -26,7 +26,7 @@ Update 和 Move。所有路径必须是容器内绝对路径，因此工具没�
 
 宿主机 Python 负责解析 patch、读取原内容、匹配上下文并生成新内容。容器内
 只执行固定的 Bash 读写脚本，文件路径通过 argv 传递，文件内容通过 stdin
-传递，不会把模型文本拼接到 shell 命令中。实现依赖当前 dexec 已经要求的
+传递，不会把模型文本拼接到 shell 命令中。实现只依赖容器执行功能已经要求的
 Bash、GNU timeout 和 coreutils，不在容器内安装 helper。
 
 同一服务进程只有一个 patch `asyncio.Lock`，所以同一固定容器的 patch 调用
@@ -45,10 +45,10 @@ patch 不写独立 RUNLOG。
 `stdin` 省略时不传 `docker exec -i`；即使传入空字符串，也会使用 `-i` 并
 关闭输入流。二进制数据不应通过该文本参数传递。
 
-MCP 工具通过可选的 `stdin` 字段接收文本。Manually 调用的 CLI 使用
+MCP 工具通过可选的 `stdin` 字段接收文本。人工调用的 CLI 使用
 `exec COMMAND [-]`：省略尾部参数时不传 stdin，尾部 `-` 表示读取当前
 进程的 stdin 并转发给容器命令。CLI 不接受 stdin 文件路径；需要读取文件时
-使用 shell 重定向，例如 `mcp-dexec ... exec 'bash -s' - < script.sh`。
+使用 shell 重定向，例如 `container-mcp ... exec 'bash -s' - < script.sh`。
 
 ## 输出、超时与取消
 
