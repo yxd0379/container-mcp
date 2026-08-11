@@ -584,6 +584,7 @@ def test_systemd_unit_uses_current_python_and_central_runlog(
 
     assert "Type=simple" in unit
     assert f'ExecStart="{Path(sys.executable)}"' in unit
+    assert '"-m" "container_mcp.server"' in unit
     assert f'"{tmp_path / "central-runlog"}"' in unit
     assert '"--allow-container" "dev-container"' in unit
     assert '"--allow-container" "simjoin"' in unit

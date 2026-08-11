@@ -1476,6 +1476,11 @@ def _systemd_quote(value: str | Path) -> str:
     return f'"{text}"'
 
 
+def _server_command_prefix() -> list[str]:
+    """Invoke the server as a package so relative imports work after installation."""
+    return [str(Path(sys.executable).absolute()), "-m", "container_mcp.server"]
+
+
 def _systemd_unit(
     *,
     service_name: str,
@@ -1485,8 +1490,7 @@ def _systemd_unit(
 ) -> str:
     del service_name
     command_parts: list[str | Path] = [
-        Path(sys.executable).absolute(),
-        Path(__file__).resolve(),
+        *_server_command_prefix(),
         "--runlog-dir",
         RUNLOG_DIR,
     ]
@@ -1587,8 +1591,7 @@ def _start_detached_service(port: int) -> int:
     SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)
     SERVICE_PID_PATH.unlink(missing_ok=True)
     command = [
-        str(Path(sys.executable).absolute()),
-        str(Path(__file__).resolve()),
+        *_server_command_prefix(),
         "--runlog-dir",
         str(RUNLOG_DIR),
         "--managed-service",
