@@ -26,19 +26,36 @@ import anyio
 import mcp.types as mcp_types
 from mcp.server.fastmcp import Context, FastMCP
 
-from patch_engine import FileOperation, PatchError, apply_update, parse_patch
+from .patch_engine import FileOperation, PatchError, apply_update, parse_patch
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR = Path(__file__).resolve().parent
+SOURCE_ROOT_CANDIDATE = PACKAGE_DIR.parents[1]
+SOURCE_ROOT = SOURCE_ROOT_CANDIDATE if (SOURCE_ROOT_CANDIDATE / "pyproject.toml").is_file() else None
+PROJECT_DIR = SOURCE_ROOT or PACKAGE_DIR
 WORKING_DIR = Path.cwd()
-RUNLOG_DIR = PROJECT_DIR.parent / "RUNLOG"
-CONTAINER = os.environ.get("CONTAINER_MCP_CONTAINER", "simjoin")
+SOURCE_CHECKOUT = SOURCE_ROOT is not None
+
+
+def _default_state_dir() -> Path:
+    configured = os.environ.get("CONTAINER_MCP_STATE_DIR")
+    if configured:
+        path = Path(configured).expanduser()
+        return (WORKING_DIR / path).resolve() if not path.is_absolute() else path.resolve()
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_home.expanduser().resolve() / "container-mcp"
+
+
+SERVICE_STATE_DIR = _default_state_dir()
+DEFAULT_RUNLOG_DIR = PROJECT_DIR / "RUNLOG" if SOURCE_CHECKOUT else SERVICE_STATE_DIR / "RUNLOG"
+RUNLOG_DIR = DEFAULT_RUNLOG_DIR
+ALLOWED_CONTAINERS: frozenset[str] | None = None
 CODEX_THREAD_ID_META_KEY = "threadId"
 MANUAL_RUN_ID = "manual"
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 9943
-DEFAULT_SERVICE_NAME = "simjoin-container-mcp.service"
-SERVICE_STATE_DIR = PROJECT_DIR / ".service"
+DEFAULT_SERVICE_NAME = "container-mcp.service"
+# Stable filenames let source and uv-tool entry points manage the same singleton.
 SERVICE_PID_PATH = SERVICE_STATE_DIR / "container-mcp.pid"
 SERVICE_LOG_PATH = SERVICE_STATE_DIR / "container-mcp.log"
 MAX_RETURN_CHARS = 60_000
@@ -53,6 +70,7 @@ PROCESS_TERMINATE_GRACE_SEC = 5
 CONTAINER_CLEANUP_TIMEOUT_SEC = 8
 STDIN_CLOSE_TIMEOUT_SEC = 5
 PATCH_COMMAND_TIMEOUT_SEC = 30
+CONTAINER_INFO_TIMEOUT_SEC = 10
 PATCH_MISSING_EXIT_CODE = 44
 PATCH_DIRECTORY_EXIT_CODE = 45
 _BASH_JOB_CONTROL_NOISE = (
@@ -166,18 +184,61 @@ if [ -d "$path" ]; then
 fi
 rm -- "$path"
 """.strip()
-_patch_lock = asyncio.Lock()
+_CONTAINER_INSPECT_FORMAT = """
+name={{.Name}}
+image={{.Config.Image}}
+status={{.State.Status}}
+user={{.Config.User}}
+cwd={{.Config.WorkingDir}}
+cmd={{json .Config.Cmd}}
+
+runtime={{.HostConfig.Runtime}}
+privileged={{.HostConfig.Privileged}}
+caps_add={{json .HostConfig.CapAdd}}
+caps_drop={{json .HostConfig.CapDrop}}
+security={{json .HostConfig.SecurityOpt}}
+apparmor={{json .AppArmorProfile}}
+readonly_rootfs={{.HostConfig.ReadonlyRootfs}}
+
+network={{.HostConfig.NetworkMode}}
+pid_ns={{.HostConfig.PidMode}}
+ipc_ns={{.HostConfig.IpcMode}}
+uts_ns={{.HostConfig.UTSMode}}
+user_ns={{.HostConfig.UsernsMode}}
+cgroup_ns={{.HostConfig.CgroupnsMode}}
+
+devices={{json .HostConfig.Devices}}
+device_rules={{json .HostConfig.DeviceCgroupRules}}
+device_requests={{json .HostConfig.DeviceRequests}}
+mounts={{json .Mounts}}
+
+ports={{json .Config.ExposedPorts}}
+port_bindings={{json .HostConfig.PortBindings}}
+publish_all_ports={{.HostConfig.PublishAllPorts}}
+extra_hosts={{json .HostConfig.ExtraHosts}}
+dns={{json .HostConfig.Dns}}
+
+pids_limit={{json .HostConfig.PidsLimit}}
+oom_kill_disable={{json .HostConfig.OomKillDisable}}
+ulimits={{json .HostConfig.Ulimits}}
+""".strip()
+_patch_locks: dict[str, asyncio.Lock] = {}
 
 
 server = FastMCP(
     "container-mcp",
     instructions=(
-        "Run commands inside the configured already-running container. "
+        "Run commands inside an explicitly selected already-running container. "
+        "Every tool call must name its target container. "
         "The Codex thread id is read automatically from each MCP request's metadata; "
         "do not pass it as a tool argument. Commands and complete output are persisted "
         "under the configured RUNLOG directory. Text stdin is supported through the "
         "optional stdin argument. The apply_patch tool applies Codex-style patches "
-        "to absolute paths inside the same container."
+        "to absolute paths inside the selected container. Use container_info before "
+        "potentially risky operations and evaluate privileged mode, capabilities, "
+        "host or shared namespaces, devices, and host mounts. Never assume container "
+        "isolation protects the host; avoid actions that could affect host processes, "
+        "devices, or filesystems."
     ),
 )
 
@@ -434,8 +495,6 @@ def _write_log_header(fh: TextIO, thread_id: str) -> None:
         fh.write(f"codex-title: {_yaml_quote(codex_title)}\n")
     if codex_rollout_path:
         fh.write(f"codex-rollout-path: {_yaml_quote(codex_rollout_path)}\n")
-    fh.write(f"container: {CONTAINER}\n")
-    fh.write(f"executor: {_yaml_quote(f'docker exec {CONTAINER} timeout ... bash -ic')}\n")
     fh.write("---\n\n")
 
 
@@ -462,6 +521,7 @@ def _stdin_byte_count(stdin: str) -> int:
 
 def _append_log(
     *,
+    container: str,
     command: str,
     stdin: str | None,
     stdout: _TextCapture,
@@ -485,6 +545,8 @@ def _append_log(
             f"{end.astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} "
             f"({duration_sec}s), exit-code: {exit_code}\n"
         )
+        fh.write(f"container: {container}\n")
+        fh.write(f"executor: {_yaml_quote(f'docker exec {container} timeout ... bash -ic')}\n")
         fh.write("```bash\n")
         fh.write(command)
         if not command.endswith("\n"):
@@ -635,13 +697,17 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-async def _cleanup_container_group(pidfile: str, wait_attempts: int = 0) -> tuple[str, bool]:
+async def _cleanup_container_group(
+    container: str,
+    pidfile: str,
+    wait_attempts: int = 0,
+) -> tuple[str, bool]:
     """Kill the command process group from inside the container and remove its pidfile."""
     try:
         process = await asyncio.create_subprocess_exec(
             "docker",
             "exec",
-            CONTAINER,
+            container,
             "bash",
             "-c",
             _CONTAINER_CLEANUP,
@@ -690,6 +756,7 @@ async def _execute(
     timeout_sec: int = 120,
     stdin: str | None = None,
     *,
+    container: str,
     thread_id: str,
     ctx: Context | None = None,
 ) -> tuple[str, int | str]:
@@ -729,7 +796,7 @@ async def _execute(
             args.append("-i")
         args.extend(
             (
-                CONTAINER,
+                container,
                 "timeout",
                 "--signal=TERM",
                 f"--kill-after={CONTAINER_KILL_AFTER_SEC}s",
@@ -786,13 +853,17 @@ async def _execute(
             container_group_found = False
             if needs_container_cleanup:
                 wait_attempts = 20 if process is not None and not host_timed_out else 0
-                cleanup_error, container_group_found = await _cleanup_container_group(pidfile, wait_attempts)
+                cleanup_error, container_group_found = await _cleanup_container_group(
+                    container,
+                    pidfile,
+                    wait_attempts,
+                )
                 if cleanup_error:
                     diagnostics.append(cleanup_error)
             if process is not None and process.returncode is None:
                 await _terminate_process(process)
             if needs_container_cleanup and process is not None and not container_group_found:
-                cleanup_error, _ = await _cleanup_container_group(pidfile, 20)
+                cleanup_error, _ = await _cleanup_container_group(container, pidfile, 20)
                 if cleanup_error:
                     diagnostics.append(cleanup_error)
             if process is not None and raw_return_code is None:
@@ -827,7 +898,7 @@ async def _execute(
                 exit_code = completed_exit_code
             elif raw_return_code == 124:
                 exit_code = "timeout"
-                cleanup_error, _ = await _cleanup_container_group(pidfile)
+                cleanup_error, _ = await _cleanup_container_group(container, pidfile)
                 if cleanup_error:
                     diagnostics.append(cleanup_error)
                 diagnostics.append(f"Command timed out after {timeout_sec}s.")
@@ -847,6 +918,7 @@ async def _execute(
             try:
                 await asyncio.to_thread(
                     _append_log,
+                    container=container,
                     command=command,
                     stdin=stdin,
                     stdout=stdout,
@@ -886,6 +958,7 @@ class _PreparedPatchOperation:
 
 
 async def _run_patch_shell(
+    container: str,
     script: str,
     path: str,
     *,
@@ -897,7 +970,7 @@ async def _run_patch_shell(
         args.append("-i")
     args.extend(
         (
-            CONTAINER,
+            container,
             "timeout",
             "--signal=TERM",
             f"--kill-after={CONTAINER_KILL_AFTER_SEC}s",
@@ -921,7 +994,7 @@ async def _run_patch_shell(
     except OSError as exc:
         raise PatchError(
             "container_unavailable",
-            f"Could not execute Docker for container {CONTAINER}: {exc}",
+            f"Could not execute Docker for container {container}: {exc}",
             path=path,
         ) from exc
 
@@ -956,8 +1029,8 @@ def _patch_failure_message(operation: str, path: str, result: _PatchCommandResul
     return f"Failed to {operation} {path}: {detail}"
 
 
-async def _read_patch_path(path: str) -> bytes | None:
-    result = await _run_patch_shell(_PATCH_READ, path)
+async def _read_patch_path(container: str, path: str) -> bytes | None:
+    result = await _run_patch_shell(container, _PATCH_READ, path)
     if result.exit_code == 0:
         return result.stdout
     if result.exit_code == PATCH_MISSING_EXIT_CODE:
@@ -972,13 +1045,14 @@ async def _read_patch_path(path: str) -> bytes | None:
 
 
 async def _prepare_patch(
+    container: str,
     operations: tuple[FileOperation, ...],
 ) -> tuple[_PreparedPatchOperation, ...]:
     virtual_files: dict[str, bytes | None] = {}
 
     async def read(path: str) -> bytes | None:
         if path not in virtual_files:
-            virtual_files[path] = await _read_patch_path(path)
+            virtual_files[path] = await _read_patch_path(container, path)
         return virtual_files[path]
 
     prepared: list[_PreparedPatchOperation] = []
@@ -1038,8 +1112,9 @@ async def _prepare_patch(
     return tuple(prepared)
 
 
-async def _write_patch_path(path: str, content: bytes) -> None:
+async def _write_patch_path(container: str, path: str, content: bytes) -> None:
     result = await _run_patch_shell(
+        container,
         _PATCH_WRITE,
         path,
         extra_args=(str(len(content)),),
@@ -1051,31 +1126,34 @@ async def _write_patch_path(path: str, content: bytes) -> None:
     raise PatchError(code, _patch_failure_message("write", path, result), path=path)
 
 
-async def _delete_patch_path(path: str) -> None:
-    result = await _run_patch_shell(_PATCH_DELETE, path)
+async def _delete_patch_path(container: str, path: str) -> None:
+    result = await _run_patch_shell(container, _PATCH_DELETE, path)
     if result.exit_code == 0:
         return
     code = "path_is_directory" if result.exit_code == PATCH_DIRECTORY_EXIT_CODE else "delete_failed"
     raise PatchError(code, _patch_failure_message("delete", path, result), path=path)
 
 
-async def _commit_patch(operations: tuple[_PreparedPatchOperation, ...]) -> str:
+async def _commit_patch(
+    container: str,
+    operations: tuple[_PreparedPatchOperation, ...],
+) -> str:
     applied: list[str] = []
     try:
         for operation in operations:
             if operation.action in {"add", "update"}:
                 assert operation.content is not None
-                await _write_patch_path(operation.path, operation.content)
+                await _write_patch_path(container, operation.path, operation.content)
                 applied.append(f"{'A' if operation.action == 'add' else 'M'} {operation.path}")
             elif operation.action == "delete":
-                await _delete_patch_path(operation.path)
+                await _delete_patch_path(container, operation.path)
                 applied.append(f"D {operation.path}")
             elif operation.action == "move":
                 assert operation.content is not None
                 assert operation.move_path is not None
-                await _write_patch_path(operation.move_path, operation.content)
+                await _write_patch_path(container, operation.move_path, operation.content)
                 applied.append(f"A {operation.move_path} (move destination)")
-                await _delete_patch_path(operation.path)
+                await _delete_patch_path(container, operation.path)
                 applied[-1] = f"M {operation.path} -> {operation.move_path}"
             else:
                 raise PatchError(
@@ -1096,33 +1174,101 @@ async def _commit_patch(operations: tuple[_PreparedPatchOperation, ...]) -> str:
     return "Success. Updated the following files:\n" + "\n".join(applied)
 
 
-@server.tool()
-async def apply_patch(patch: str) -> str:
-    """Apply a Codex-style patch to absolute paths in the configured container.
+def _patch_lock_for(container: str) -> asyncio.Lock:
+    lock = _patch_locks.get(container)
+    if lock is None:
+        lock = asyncio.Lock()
+        _patch_locks[container] = lock
+    return lock
 
-    Calls are globally serialized. Every hunk is parsed and checked before the first
-    write. Each file write uses a same-directory temporary file and atomic rename;
-    multi-file rollback is intentionally not provided.
+
+@server.tool()
+async def container_info(container: str) -> str:
+    """Inspect isolation-relevant metadata for an allowed, currently running container."""
+    selected_container = _resolve_container(container)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            "inspect",
+            selected_container,
+            "--format",
+            _CONTAINER_INSPECT_FORMAT,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=WORKING_DIR,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect container {selected_container}: {exc}") from exc
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=CONTAINER_INFO_TIMEOUT_SEC,
+        )
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            await _terminate_process(process)
+        raise
+    except asyncio.TimeoutError as exc:
+        if process.returncode is None:
+            await _terminate_process(process)
+        raise RuntimeError(
+            f"Inspecting container {selected_container} timed out after "
+            f"{CONTAINER_INFO_TIMEOUT_SEC}s"
+        ) from exc
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"Could not inspect container {selected_container}: "
+            f"{detail or f'docker inspect exited with code {process.returncode}'}"
+        )
+
+    metadata = stdout.decode("utf-8", errors="replace").strip()
+    status = next(
+        (line.removeprefix("status=") for line in metadata.splitlines() if line.startswith("status=")),
+        "",
+    )
+    if status != "running":
+        displayed_status = status or "unknown"
+        raise ValueError(
+            f"container {selected_container!r} is not running (status: {displayed_status})"
+        )
+    return metadata
+
+
+@server.tool()
+async def apply_patch(patch: str, container: str) -> str:
+    """Apply a Codex-style patch to absolute paths in an allowed container.
+
+    Calls targeting the same container are serialized. Every hunk is parsed and checked
+    before the first write. Each file write uses a same-directory temporary file and
+    atomic rename; multi-file rollback is intentionally not provided.
     """
-    async with _patch_lock:
+    selected_container = _resolve_container(container)
+    async with _patch_lock_for(selected_container):
         operations = parse_patch(patch)
-        prepared = await _prepare_patch(operations)
+        prepared = await _prepare_patch(selected_container, operations)
         with anyio.CancelScope(shield=True):
-            return await _commit_patch(prepared)
+            return await _commit_patch(selected_container, prepared)
 
 
 @server.tool()
 async def dexec(
     command: str,
+    container: str,
     timeout_sec: int = 120,
     stdin: str | None = None,
     ctx: Context | None = None,
 ) -> str:
-    """Run a command in the configured container, with optional text stdin and a complete audit log."""
+    """Run a command in an allowed container, with optional text stdin and a complete audit log."""
+    selected_container = _resolve_container(container)
     result, _ = await _execute(
         command,
         timeout_sec=timeout_sec,
         stdin=stdin,
+        container=selected_container,
         thread_id=_codex_thread_id(ctx),
         ctx=ctx,
     )
@@ -1137,12 +1283,29 @@ def _configure_runlog_dir(value: str) -> Path:
 
 
 def _container_argument(value: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
-        raise argparse.ArgumentTypeError(
+    try:
+        return _validate_container(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _validate_container(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+        raise ValueError(
             "container must be a Docker container name or id using only letters, "
             "digits, underscore, period, and hyphen"
         )
     return value
+
+
+def _resolve_container(value: str) -> str:
+    container = _validate_container(value)
+    if not ALLOWED_CONTAINERS:
+        raise RuntimeError("container-mcp has no allowed containers configured")
+    if container not in ALLOWED_CONTAINERS:
+        allowed = ", ".join(sorted(ALLOWED_CONTAINERS))
+        raise ValueError(f"container {container!r} is not allowed; allowed containers: {allowed}")
+    return container
 
 
 def _port_argument(value: str) -> int:
@@ -1164,15 +1327,22 @@ def _argument_parser() -> argparse.ArgumentParser:
         description="Run the container MCP server or execute a container command manually."
     )
     parser.add_argument(
-        "--container",
-        default=os.environ.get("CONTAINER_MCP_CONTAINER", "simjoin"),
+        "--allow-container",
+        action="append",
+        default=[],
         type=_container_argument,
-        help="Name or id of the already-running Docker container (default: simjoin).",
+        metavar="NAME",
+        help="Container name or id tools may access; repeat to allow multiple containers.",
     )
     parser.add_argument(
         "--runlog-dir",
-        default=os.environ.get("CONTAINER_MCP_RUNLOG_DIR", str(PROJECT_DIR.parent / "RUNLOG")),
-        help="RUNLOG directory (default: monorepo RUNLOG).",
+        default=os.environ.get("CONTAINER_MCP_RUNLOG_DIR", str(DEFAULT_RUNLOG_DIR)),
+        help=f"RUNLOG directory (default: {DEFAULT_RUNLOG_DIR}).",
+    )
+    parser.add_argument(
+        "--managed-service",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     subparsers = parser.add_subparsers(dest="mode")
     exec_parser = subparsers.add_parser(
@@ -1186,8 +1356,14 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="Command timeout in seconds, from 1 to 3600 (default: 120).",
     )
     exec_parser.add_argument(
+        "--container",
+        required=True,
+        type=_container_argument,
+        help="Name or id of the container in which to execute the command.",
+    )
+    exec_parser.add_argument(
         "command",
-        help="Shell command to execute inside the configured container.",
+        help="Shell command to execute inside the selected container.",
     )
     exec_parser.add_argument(
         "stdin_source",
@@ -1226,7 +1402,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--service-name",
         default=DEFAULT_SERVICE_NAME,
         type=_service_name_argument,
-        help="systemd user unit name (default: simjoin-container-mcp.service).",
+        help="systemd user unit name (default: container-mcp.service).",
     )
     install_parser.add_argument(
         "--scope",
@@ -1308,22 +1484,16 @@ def _systemd_unit(
     service_user: str | None = None,
 ) -> str:
     del service_name
-    command = " ".join(
-        _systemd_quote(part)
-        for part in (
-            Path(sys.executable).absolute(),
-            Path(__file__).resolve(),
-            "--container",
-            CONTAINER,
-            "--runlog-dir",
-            RUNLOG_DIR,
-            "serve",
-            "--host",
-            DEFAULT_HTTP_HOST,
-            "--port",
-            str(port),
-        )
-    )
+    command_parts: list[str | Path] = [
+        Path(sys.executable).absolute(),
+        Path(__file__).resolve(),
+        "--runlog-dir",
+        RUNLOG_DIR,
+    ]
+    for container in sorted(ALLOWED_CONTAINERS or ()):
+        command_parts.extend(("--allow-container", container))
+    command_parts.extend(("serve", "--host", DEFAULT_HTTP_HOST, "--port", str(port)))
+    command = " ".join(_systemd_quote(part) for part in command_parts)
     system_user = ""
     if scope == "system":
         if not service_user or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", service_user):
@@ -1333,7 +1503,7 @@ def _systemd_unit(
     after = "docker.service" if scope == "system" else "default.target"
     return (
         "[Unit]\n"
-        f"Description=Persistent container MCP service for {CONTAINER}\n"
+        "Description=Persistent multi-container MCP service\n"
         f"After={after}\n\n"
         "[Service]\n"
         "Type=simple\n"
@@ -1393,8 +1563,7 @@ def _service_process_matches(pid: int) -> bool:
         command = (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
     except OSError:
         return False
-    server_path = os.fsencode(str(Path(__file__).resolve()))
-    return server_path in command and b"serve" in command
+    return b"--managed-service" in command and b"serve" in command
 
 
 def _wait_for_service(port: int, process: subprocess.Popen[bytes]) -> None:
@@ -1420,16 +1589,13 @@ def _start_detached_service(port: int) -> int:
     command = [
         str(Path(sys.executable).absolute()),
         str(Path(__file__).resolve()),
-        "--container",
-        CONTAINER,
         "--runlog-dir",
         str(RUNLOG_DIR),
-        "serve",
-        "--host",
-        DEFAULT_HTTP_HOST,
-        "--port",
-        str(port),
+        "--managed-service",
     ]
+    for container in sorted(ALLOWED_CONTAINERS or ()):
+        command.extend(("--allow-container", container))
+    command.extend(("serve", "--host", DEFAULT_HTTP_HOST, "--port", str(port)))
     with SERVICE_LOG_PATH.open("ab", buffering=0) as service_log:
         process = subprocess.Popen(
             command,
@@ -1469,9 +1635,9 @@ def _stop_detached_service() -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    global CONTAINER, RUNLOG_DIR
+    global ALLOWED_CONTAINERS, RUNLOG_DIR
     args = _parse_args(argv)
-    CONTAINER = args.container
+    ALLOWED_CONTAINERS = frozenset(args.allow_container)
     RUNLOG_DIR = _configure_runlog_dir(args.runlog_dir)
     if args.mode == "exec":
         try:
@@ -1481,6 +1647,7 @@ def main(argv: list[str] | None = None) -> None:
                     args.command,
                     timeout_sec=args.timeout_sec,
                     stdin=stdin,
+                    container=args.container,
                     thread_id=MANUAL_RUN_ID,
                     ctx=_ManualContext(),
                 )
@@ -1490,6 +1657,13 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(2) from exc
         print(result)
         raise SystemExit(_manual_exit_status(exit_code))
+    service_start_modes = {None, "serve", "install-service", "start-service"}
+    if args.mode in service_start_modes and not ALLOWED_CONTAINERS:
+        print(
+            "container-mcp: error: at least one --allow-container is required for MCP service mode",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     if args.mode == "serve":
         server.settings.host = args.host
         server.settings.port = args.port

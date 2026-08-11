@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from patch_engine import PatchError, apply_update, parse_patch
+from container_mcp.patch_engine import PatchError, apply_update, parse_patch
 
 
 def test_parse_patch_supports_all_codex_file_operations() -> None:

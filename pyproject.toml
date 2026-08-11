@@ -2,9 +2,12 @@
 name = "container-mcp"
 version = "0.1.0"
 description = "Shared MCP service for executing commands and applying patches in a Docker container."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "mcp>=1.28.1",
+  "mcp==1.28.1",
+  # 2.15 emits an unresolved FastMCP lifespan warning during every CLI startup.
+  "pydantic-settings==2.14.2",
 ]
 
 [dependency-groups]
@@ -13,14 +16,14 @@ test = [
 ]
 
 [project.scripts]
-container-mcp = "server:main"
+container-mcp = "container_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["server.py", "patch_engine.py"]
+packages = ["src/container_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

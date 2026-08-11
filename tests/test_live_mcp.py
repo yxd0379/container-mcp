@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import uuid
 from datetime import timedelta
 
 import httpx
@@ -14,6 +15,7 @@ from mcp.shared.exceptions import McpError
 
 
 SERVICE_URL = os.environ.get("CONTAINER_MCP_URL", "http://127.0.0.1:9943/mcp")
+SERVICE_CONTAINER = os.environ.get("CONTAINER_MCP_TEST_CONTAINER", "simjoin")
 
 
 pytestmark = pytest.mark.skipif(
@@ -43,9 +45,65 @@ async def test_streamable_http_accepts_concurrent_clients() -> None:
                     initialization = await session.initialize()
                     assert initialization.serverInfo.name == "container-mcp"
                     tools = await session.list_tools()
-                    assert {tool.name for tool in tools.tools} == {"apply_patch", "dexec"}
+                    assert {tool.name for tool in tools.tools} == {
+                        "apply_patch",
+                        "container_info",
+                        "dexec",
+                    }
 
     await asyncio.gather(*(initialize_client() for _ in range(4)))
+
+
+@pytest.mark.anyio
+async def test_live_rejects_container_outside_allowlist() -> None:
+    request_meta = {"threadId": str(uuid.uuid4())}
+    async with httpx.AsyncClient(trust_env=False) as http_client:
+        async with streamable_http_client(
+            SERVICE_URL,
+            http_client=http_client,
+        ) as (read_stream, write_stream, _), ClientSession(
+            read_stream,
+            write_stream,
+            read_timeout_seconds=timedelta(seconds=15),
+        ) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "dexec",
+                arguments={
+                    "container": "container-mcp-not-allowed",
+                    "command": "true",
+                },
+                meta=request_meta,
+            )
+
+    text = "\n".join(str(getattr(content, "text", "")) for content in result.content)
+    assert result.isError
+    assert "is not allowed" in text
+
+
+@pytest.mark.anyio
+async def test_live_container_info_reports_running_isolation_metadata() -> None:
+    async with httpx.AsyncClient(trust_env=False) as http_client:
+        async with streamable_http_client(
+            SERVICE_URL,
+            http_client=http_client,
+        ) as (read_stream, write_stream, _), ClientSession(
+            read_stream,
+            write_stream,
+            read_timeout_seconds=timedelta(seconds=15),
+        ) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "container_info",
+                arguments={"container": SERVICE_CONTAINER},
+            )
+
+    text = "\n".join(str(getattr(content, "text", "")) for content in result.content)
+    assert not result.isError
+    assert "status=running" in text
+    assert "privileged=" in text
+    assert "pid_ns=" in text
+    assert "mounts=" in text
 
 
 @pytest.mark.anyio
@@ -82,12 +140,14 @@ async def test_live_streamable_http_tool_supports_stdin_and_progress() -> None:
             tools = await session.list_tools()
             dexec_tool = next(tool for tool in tools.tools if tool.name == "dexec")
             assert "stdin" in dexec_tool.inputSchema["properties"]
+            assert dexec_tool.inputSchema["required"] == ["command", "container"]
             assert "thread_id" not in dexec_tool.inputSchema["properties"]
             request_meta = {"threadId": thread_id}
 
             result = await session.call_tool(
                 "dexec",
                 arguments={
+                    "container": SERVICE_CONTAINER,
                     "command": (
                         "read -r value; printf 'stdin=%s\\n' \"$value\"; "
                         "printf 'phase-one\\n'; sleep 1.2; printf 'phase-two\\n'"
@@ -104,6 +164,7 @@ async def test_live_streamable_http_tool_supports_stdin_and_progress() -> None:
             timeout_result = await session.call_tool(
                 "dexec",
                 arguments={
+                    "container": SERVICE_CONTAINER,
                     "command": (
                         f"rm -f -- {quoted_sentinel}; sleep 3; "
                         f"printf 'late write\\n' > {quoted_sentinel}"
@@ -116,6 +177,7 @@ async def test_live_streamable_http_tool_supports_stdin_and_progress() -> None:
             natural_124_result = await session.call_tool(
                 "dexec",
                 arguments={
+                    "container": SERVICE_CONTAINER,
                     "command": "printf 'natural 124\\n'; exit 124",
                     "timeout_sec": 5,
                 },
@@ -138,6 +200,7 @@ async def test_live_streamable_http_tool_supports_stdin_and_progress() -> None:
                 session.call_tool(
                     "dexec",
                     arguments={
+                        "container": SERVICE_CONTAINER,
                         "command": (
                             f"rm -f -- {quoted_cancel_sentinel}; sleep 3; "
                             f"printf 'late cancel write\\n' > {quoted_cancel_sentinel}"
@@ -165,6 +228,7 @@ async def test_live_streamable_http_tool_supports_stdin_and_progress() -> None:
             cancel_verify_result = await session.call_tool(
                 "dexec",
                 arguments={
+                    "container": SERVICE_CONTAINER,
                     "command": (
                         "sleep 4; "
                         f"if [ -e {quoted_cancel_sentinel} ]; then "
@@ -178,6 +242,7 @@ async def test_live_streamable_http_tool_supports_stdin_and_progress() -> None:
             verify_result = await session.call_tool(
                 "dexec",
                 arguments={
+                    "container": SERVICE_CONTAINER,
                     "command": (
                         "sleep 2; "
                         f"if [ -e {quoted_sentinel} ]; then "

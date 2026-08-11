@@ -12,6 +12,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 
 SERVICE_URL = os.environ.get("CONTAINER_MCP_URL", "http://127.0.0.1:9943/mcp")
+SERVICE_CONTAINER = os.environ.get("CONTAINER_MCP_TEST_CONTAINER", "simjoin")
 
 
 pytestmark = pytest.mark.skipif(
@@ -54,13 +55,14 @@ async def test_live_apply_patch_uses_absolute_paths_and_preflights() -> None:
             await session.initialize()
             tools = await session.list_tools()
             patch_tool = next(tool for tool in tools.tools if tool.name == "apply_patch")
-            assert patch_tool.inputSchema["required"] == ["patch"]
-            assert set(patch_tool.inputSchema["properties"]) == {"patch"}
+            assert patch_tool.inputSchema["required"] == ["patch", "container"]
+            assert set(patch_tool.inputSchema["properties"]) == {"patch", "container"}
 
             try:
                 result = await session.call_tool(
                     "apply_patch",
                     arguments={
+                        "container": SERVICE_CONTAINER,
                         "patch": (
                             "*** Begin Patch\n"
                             f"*** Add File: {source}\n"
@@ -87,6 +89,7 @@ async def test_live_apply_patch_uses_absolute_paths_and_preflights() -> None:
                 verify = await session.call_tool(
                     "dexec",
                     arguments={
+                        "container": SERVICE_CONTAINER,
                         "command": (
                             f"test ! -e {quoted_source} && "
                             f"test ! -e {quoted_removed} && "
@@ -103,6 +106,7 @@ async def test_live_apply_patch_uses_absolute_paths_and_preflights() -> None:
                 failed = await session.call_tool(
                     "apply_patch",
                     arguments={
+                        "container": SERVICE_CONTAINER,
                         "patch": (
                             "*** Begin Patch\n"
                             f"*** Add File: {should_not_exist}\n"
@@ -123,6 +127,7 @@ async def test_live_apply_patch_uses_absolute_paths_and_preflights() -> None:
                 no_partial_write = await session.call_tool(
                     "dexec",
                     arguments={
+                        "container": SERVICE_CONTAINER,
                         "command": f"test ! -e {quoted_should_not_exist}",
                         "timeout_sec": 10,
                     },
@@ -134,6 +139,7 @@ async def test_live_apply_patch_uses_absolute_paths_and_preflights() -> None:
                 write_failure = await session.call_tool(
                     "apply_patch",
                     arguments={
+                        "container": SERVICE_CONTAINER,
                         "patch": (
                             "*** Begin Patch\n"
                             f"*** Add File: {read_only_path}\n"
@@ -149,6 +155,10 @@ async def test_live_apply_patch_uses_absolute_paths_and_preflights() -> None:
                 quoted_base = shlex.quote(base)
                 await session.call_tool(
                     "dexec",
-                    arguments={"command": f"rm -rf -- {quoted_base}", "timeout_sec": 10},
+                    arguments={
+                        "container": SERVICE_CONTAINER,
+                        "command": f"rm -rf -- {quoted_base}",
+                        "timeout_sec": 10,
+                    },
                     meta=request_meta,
                 )

@@ -12,9 +12,7 @@ import anyio
 import mcp.types as mcp_types
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import server
+from container_mcp import server
 
 
 TEST_THREAD_ID = "019f0000-0000-7000-8000-000000000001"
@@ -47,12 +45,17 @@ def isolated_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runlog_dir = tmp_path / "runlogs"
     monkeypatch.setattr(server, "RUNLOG_DIR", runlog_dir)
     monkeypatch.setattr(server, "WORKING_DIR", tmp_path)
-    monkeypatch.setattr(server, "CONTAINER", "simjoin")
+    monkeypatch.setattr(server, "ALLOWED_CONTAINERS", frozenset({"simjoin", "portable-container_2"}))
+    monkeypatch.setattr(server, "_patch_locks", {})
     monkeypatch.setattr(server, "PROGRESS_INTERVAL_SEC", 0.02)
     monkeypatch.setattr(server, "HOST_TIMEOUT_OVERHEAD_SEC", 0.2)
     monkeypatch.setattr(server, "_codex_thread_metadata", lambda _thread_id: ("", ""))
 
-    async def no_container_cleanup(_pidfile: str, _wait_attempts: int = 0) -> tuple[str, bool]:
+    async def no_container_cleanup(
+        _container: str,
+        _pidfile: str,
+        _wait_attempts: int = 0,
+    ) -> tuple[str, bool]:
         return "", False
 
     monkeypatch.setattr(server, "_cleanup_container_group", no_container_cleanup)
@@ -92,6 +95,7 @@ def current_log_path(runlog_dir: Path) -> Path:
 def run_dexec(
     command: str,
     *,
+    container: str = "simjoin",
     stdin: str | None = None,
     timeout_sec: int = 10,
     ctx: FakeContext | None = None,
@@ -100,6 +104,7 @@ def run_dexec(
     return asyncio.run(
         server.dexec(
             command,
+            container=container,
             timeout_sec=timeout_sec,
             stdin=stdin,
             ctx=request_context,
@@ -322,7 +327,11 @@ def test_cancellation_reaps_process_and_persists_audit_log(
     processes: list[asyncio.subprocess.Process] = []
     cleanup_calls: list[int] = []
 
-    async def record_cleanup(_pidfile: str, wait_attempts: int = 0) -> tuple[str, bool]:
+    async def record_cleanup(
+        _container: str,
+        _pidfile: str,
+        wait_attempts: int = 0,
+    ) -> tuple[str, bool]:
         cleanup_calls.append(wait_attempts)
         return "", False
 
@@ -335,7 +344,7 @@ def test_cancellation_reaps_process_and_persists_audit_log(
 
     async def scenario() -> None:
         task = asyncio.create_task(
-            server.dexec("cancel me", timeout_sec=10, ctx=FakeContext())
+            server.dexec("cancel me", container="simjoin", timeout_sec=10, ctx=FakeContext())
         )
         await asyncio.sleep(0.08)
         task.cancel()
@@ -366,7 +375,12 @@ def test_anyio_level_cancellation_cannot_interrupt_cleanup(
 
     async def scenario() -> None:
         async def invoke() -> None:
-            await server.dexec("anyio cancel", timeout_sec=10, ctx=FakeContext())
+            await server.dexec(
+                "anyio cancel",
+                container="simjoin",
+                timeout_sec=10,
+                ctx=FakeContext(),
+            )
 
         async with anyio.create_task_group() as task_group:
             task_group.start_soon(invoke)
@@ -391,11 +405,17 @@ def test_inputs_are_validated_before_starting_process(monkeypatch: pytest.Monkey
     with pytest.raises(ValueError, match="command must not be empty"):
         run_dexec("   ")
     with pytest.raises(RuntimeError, match=r"missing _meta\.threadId"):
-        asyncio.run(server.dexec("true", ctx=FakeContext(None)))
+        asyncio.run(server.dexec("true", container="simjoin", ctx=FakeContext(None)))
     with pytest.raises(RuntimeError, match="not a valid UUID"):
-        asyncio.run(server.dexec("true", ctx=FakeContext("parent-thread")))
+        asyncio.run(server.dexec("true", container="simjoin", ctx=FakeContext("parent-thread")))
     with pytest.raises(RuntimeError, match="not a canonical UUID"):
-        asyncio.run(server.dexec("true", ctx=FakeContext("{019f0000-0000-7000-8000-000000000001}")))
+        asyncio.run(
+            server.dexec(
+                "true",
+                container="simjoin",
+                ctx=FakeContext("{019f0000-0000-7000-8000-000000000001}"),
+            )
+        )
     with pytest.raises(ValueError, match="timeout_sec must be between"):
         run_dexec("true", timeout_sec=0)
     with pytest.raises(ValueError, match="valid UTF-8 text"):
@@ -424,6 +444,7 @@ def test_legacy_thread_argument_cannot_spoof_request_metadata(
         tool.run(
             {
                 "command": "legacy call",
+                "container": "simjoin",
                 "thread_id": PARENT_THREAD_ID,
             },
             context=FakeContext(),
@@ -436,24 +457,29 @@ def test_legacy_thread_argument_cannot_spoof_request_metadata(
     assert not parent_log.exists()
 
 
-def test_startup_arguments_configure_container_and_runlog(
+def test_startup_arguments_configure_allowlist_manual_container_and_runlog(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(server, "WORKING_DIR", tmp_path)
-    monkeypatch.setenv("CONTAINER_MCP_CONTAINER", "from-env")
-
     defaults = server._parse_args([])
     args = server._parse_args(
-        ["--container", "from-cli", "--runlog-dir", "custom/logs"]
+        [
+            "--allow-container",
+            "first-container",
+            "--allow-container",
+            "second-container",
+            "--runlog-dir",
+            "custom/logs",
+        ]
     )
     manual_args = server._parse_args(
         [
-            "--container",
-            "manual-container",
             "--runlog-dir",
             "manual/logs",
             "exec",
+            "--container",
+            "manual-container",
             "--timeout-sec",
             "17",
             "read value; printf '%s\\n' \"$value\"",
@@ -465,9 +491,9 @@ def test_startup_arguments_configure_container_and_runlog(
         ["install-service", "--port", "9943", "--service-name", "custom-container"]
     )
 
-    assert defaults.container == "from-env"
     assert defaults.mode is None
-    assert args.container == "from-cli"
+    assert defaults.allow_container == []
+    assert args.allow_container == ["first-container", "second-container"]
     assert args.mode is None
     assert server._configure_runlog_dir(args.runlog_dir) == (tmp_path / "custom/logs").resolve()
     absolute = tmp_path / "absolute"
@@ -487,9 +513,11 @@ def test_startup_arguments_configure_container_and_runlog(
     assert install_args.scope == "user"
 
     with pytest.raises(SystemExit):
-        server._parse_args(["--container", "--not-a-container"])
+        server._parse_args(["--allow-container", "--not-a-container"])
     with pytest.raises(SystemExit):
-        server._parse_args(["--container", "bad name"])
+        server._parse_args(["--allow-container", "bad name"])
+    with pytest.raises(SystemExit):
+        server._parse_args(["exec", "missing explicit container"])
 
 
 def test_default_cli_mode_still_starts_stdio_mcp(
@@ -498,7 +526,7 @@ def test_default_cli_mode_still_starts_stdio_mcp(
     calls: list[str] = []
     monkeypatch.setattr(server.server, "run", calls.append)
 
-    server.main(["--container", "simjoin", "--runlog-dir", "logs"])
+    server.main(["--allow-container", "simjoin", "--runlog-dir", "logs"])
 
     assert calls == ["stdio"]
 
@@ -509,11 +537,40 @@ def test_serve_cli_starts_streamable_http_on_loopback(
     calls: list[str] = []
     monkeypatch.setattr(server.server, "run", calls.append)
 
-    server.main(["serve", "--host", "127.0.0.1", "--port", "9943"])
+    server.main(
+        [
+            "--allow-container",
+            "simjoin",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9943",
+        ]
+    )
 
     assert calls == ["streamable-http"]
     assert server.server.settings.host == "127.0.0.1"
     assert server.server.settings.port == 9943
+
+
+def test_service_start_requires_allowlist_but_status_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(server, "_read_service_pid", lambda: None)
+
+    with pytest.raises(SystemExit) as missing_allowlist:
+        server.main(["serve"])
+    assert missing_allowlist.value.code == 2
+    assert "at least one --allow-container" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as not_running:
+        server.main(["status-service"])
+    assert not_running.value.code == 3
+    captured = capsys.readouterr()
+    assert "is not running" in captured.out
+    assert "allow-container" not in captured.err
 
 
 def test_systemd_unit_uses_current_python_and_central_runlog(
@@ -521,12 +578,15 @@ def test_systemd_unit_uses_current_python_and_central_runlog(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(server, "RUNLOG_DIR", tmp_path / "central-runlog")
+    monkeypatch.setattr(server, "ALLOWED_CONTAINERS", frozenset({"simjoin", "dev-container"}))
 
     unit = server._systemd_unit(service_name="simjoin-container-mcp.service", port=9943)
 
     assert "Type=simple" in unit
     assert f'ExecStart="{Path(sys.executable)}"' in unit
     assert f'"{tmp_path / "central-runlog"}"' in unit
+    assert '"--allow-container" "dev-container"' in unit
+    assert '"--allow-container" "simjoin"' in unit
     assert '"serve" "--host" "127.0.0.1" "--port" "9943"' in unit
     assert "Restart=on-failure" in unit
 
@@ -560,11 +620,11 @@ def test_manual_cli_exec_uses_stable_run_id_stdin_and_command_exit_code(
     with pytest.raises(SystemExit) as stopped:
         server.main(
             [
-                "--container",
-                "simjoin",
                 "--runlog-dir",
                 str(isolated_runtime),
                 "exec",
+                "--container",
+                "simjoin",
                 "--timeout-sec",
                 "9",
                 "consume input",
@@ -591,14 +651,14 @@ def test_manual_cli_exec_uses_stable_run_id_stdin_and_command_exit_code(
 def test_manual_stdin_dash_reads_process_stdin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    args = server._parse_args(["exec", "consume input", "-"])
+    args = server._parse_args(["exec", "--container", "simjoin", "consume input", "-"])
     monkeypatch.setattr(sys, "stdin", io.StringIO("piped input\n"))
 
     assert server._manual_stdin(args) == "piped input\n"
 
 
 def test_manual_stdin_is_omitted_without_dash() -> None:
-    args = server._parse_args(["exec", "consume input"])
+    args = server._parse_args(["exec", "--container", "simjoin", "consume input"])
 
     assert server._manual_stdin(args) is None
 
@@ -615,15 +675,69 @@ def test_selected_container_is_used_for_execution_and_runlog(
     isolated_runtime: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(server, "CONTAINER", "portable-container_2")
     calls = install_fake_docker(monkeypatch, "print('container-selected')")
 
-    result = run_dexec("container probe")
+    result = run_dexec("container probe", container="portable-container_2")
 
     assert "container-selected" in result
     assert calls[0][:3] == ("docker", "exec", "portable-container_2")
     log_text = current_log_path(isolated_runtime).read_text(encoding="utf-8")
     assert "container: portable-container_2" in log_text
+
+
+def test_container_info_returns_metadata_only_for_running_allowed_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    class InspectProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                b"name=/simjoin\nimage=test:latest\nstatus=running\n"
+                b"privileged=true\npid_ns=host\nmounts=[]\n",
+                b"",
+            )
+
+    async def fake_create(*args: str, **_kwargs: object) -> InspectProcess:
+        calls.append(args)
+        return InspectProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    result = asyncio.run(server.container_info("simjoin"))
+
+    assert "status=running" in result
+    assert "privileged=true" in result
+    assert calls[0][:4] == ("docker", "inspect", "simjoin", "--format")
+    assert "mounts={{json .Mounts}}" in calls[0][4]
+
+
+def test_container_info_rejects_stopped_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InspectProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"name=/simjoin\nstatus=exited\nprivileged=false\n", b""
+
+    async def fake_create(*_args: str, **_kwargs: object) -> InspectProcess:
+        return InspectProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    with pytest.raises(ValueError, match=r"not running \(status: exited\)"):
+        asyncio.run(server.container_info("simjoin"))
+
+
+def test_container_info_tool_schema_requires_container() -> None:
+    tool = server.server._tool_manager.get_tool("container_info")
+
+    assert tool is not None
+    assert tool.parameters["required"] == ["container"]
+    assert set(tool.parameters["properties"]) == {"container"}
 
 
 def test_tool_schema_exposes_stdin_but_not_context_or_thread_id() -> None:
@@ -634,7 +748,17 @@ def test_tool_schema_exposes_stdin_but_not_context_or_thread_id() -> None:
     assert "stdin" in properties
     assert "ctx" not in properties
     assert "thread_id" not in properties
-    assert tool.parameters["required"] == ["command"]
+    assert tool.parameters["required"] == ["command", "container"]
+
+
+def test_container_must_be_in_service_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "ALLOWED_CONTAINERS", frozenset({"simjoin"}))
+
+    assert server._resolve_container("simjoin") == "simjoin"
+    with pytest.raises(ValueError, match="is not allowed"):
+        server._resolve_container("other-container")
 
 
 def test_server_advertises_logging_capability() -> None:
@@ -643,40 +767,11 @@ def test_server_advertises_logging_capability() -> None:
     assert options.capabilities.logging is not None
 
 
-def test_project_configs_use_shared_http_service_and_central_runlog() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    project_names = ("feature_retrieval", "IndexSDK", "play-IndexSDK", "play-op")
-    config_paths = [
-        repo_root / "projects" / name / ".codex" / "config.toml"
-        for name in project_names
-    ]
+def test_distribution_uses_standard_src_layout() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
 
-    assert not (repo_root / ".codex" / "config.toml").exists()
-    assert (repo_root / "RUNLOG").is_dir()
-    assert not (repo_root / "wiki").exists()
-    assert not (repo_root / "scripts").exists()
-    assert not (repo_root / "container_mcp" / ".codex").exists()
-    assert not (repo_root / "container_mcp" / "RUNLOG").exists()
-    for project_name in project_names:
-        project_root = repo_root / "projects" / project_name
-        assert not (project_root / "RUNLOG").exists()
-        assert all((project_root / name).is_dir() for name in ("wiki", "notes", "scripts"))
-    for config_path in config_paths:
-        config_text = config_path.read_text(encoding="utf-8")
-        assert "[mcp_servers.container]" in config_text
-        assert 'url = "http://127.0.0.1:9943/mcp"' in config_text
-        assert "required =" not in config_text
-        assert 'command = "uv"' not in config_text
-        assert "--no-cache" not in config_text
-        assert "cwd =" not in config_text
-        assert 'env_vars = ["CODEX_THREAD_ID"]' not in config_text
-        assert "startup_timeout_sec = 60" in config_text
-        assert "tool_timeout_sec = 3700" in config_text
-
-    active_files = [
-        *config_paths,
-        repo_root / "AGENTS.md",
-        repo_root / "container_mcp" / "readme.md",
-    ]
-    legacy_repo = "play-feature" + "_retrieve"
-    assert all(legacy_repo not in path.read_text(encoding="utf-8") for path in active_files)
+    assert (repo_root / "pyproject.toml").is_file()
+    assert (repo_root / "README.md").is_file()
+    assert (repo_root / "src" / "container_mcp" / "__init__.py").is_file()
+    assert (repo_root / "src" / "container_mcp" / "server.py").is_file()
+    assert not (repo_root / "server.py").exists()
