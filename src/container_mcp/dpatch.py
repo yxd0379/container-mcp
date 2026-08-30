@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import posixpath
 import re
 from dataclasses import dataclass
+
+import anyio
+
+from .dexec import CONTAINER_KILL_AFTER_SEC, HOST_TIMEOUT_OVERHEAD_SEC, terminate_process
 
 
 BEGIN_PATCH = "*** Begin Patch"
@@ -367,3 +372,316 @@ def apply_update(path: str, original: str, chunks: tuple[UpdateChunk, ...]) -> s
     if not original_lines or original_lines[-1] != "":
         original_lines.append("")
     return "\n".join(original_lines)
+
+
+PATCH_COMMAND_TIMEOUT_SEC = 30
+PATCH_MISSING_EXIT_CODE = 44
+PATCH_DIRECTORY_EXIT_CODE = 45
+
+_PATCH_READ = """
+export LC_ALL=C
+path=$1
+if [ -d "$path" ]; then
+    printf 'path is a directory: %s\n' "$path" >&2
+    exit 45
+fi
+if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    exit 44
+fi
+cat -- "$path"
+""".strip()
+
+_PATCH_WRITE = """
+set -eu
+export LC_ALL=C
+path=$1
+expected_size=$2
+parent=${path%/*}
+if [ -z "$parent" ]; then
+    parent=/
+fi
+if [ -d "$path" ]; then
+    printf 'path is a directory: %s\n' "$path" >&2
+    exit 45
+fi
+mkdir -p -- "$parent"
+tmp=$(mktemp "$parent/.dpatch.XXXXXXXX")
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+cat > "$tmp"
+actual_size=$(wc -c < "$tmp")
+if [ "$actual_size" -ne "$expected_size" ]; then
+    printf 'incomplete stdin: expected %s bytes, received %s\n' "$expected_size" "$actual_size" >&2
+    exit 46
+fi
+if [ -e "$path" ] || [ -L "$path" ]; then
+    chmod --reference="$path" "$tmp"
+else
+    chmod 0644 "$tmp"
+fi
+mv -fT -- "$tmp" "$path"
+trap - EXIT HUP INT TERM
+""".strip()
+
+_PATCH_DELETE = """
+set -eu
+export LC_ALL=C
+path=$1
+if [ -d "$path" ]; then
+    printf 'path is a directory: %s\n' "$path" >&2
+    exit 45
+fi
+rm -- "$path"
+""".strip()
+
+_patch_locks: dict[str, asyncio.Lock] = {}
+
+
+@dataclass(frozen=True)
+class _PatchCommandResult:
+    exit_code: int
+    stdout: bytes
+    stderr: str
+
+
+@dataclass(frozen=True)
+class _PreparedPatchOperation:
+    action: str
+    path: str
+    content: bytes | None = None
+    move_path: str | None = None
+
+
+async def _run_patch_shell(
+    container: str,
+    script: str,
+    path: str,
+    *,
+    extra_args: tuple[str, ...] = (),
+    stdin: bytes | None = None,
+) -> _PatchCommandResult:
+    args = ["docker", "exec"]
+    if stdin is not None:
+        args.append("-i")
+    args.extend(
+        (
+            container,
+            "timeout",
+            "--signal=TERM",
+            f"--kill-after={CONTAINER_KILL_AFTER_SEC}s",
+            f"{PATCH_COMMAND_TIMEOUT_SEC}s",
+            "bash",
+            "-c",
+            script,
+            "dpatch",
+            path,
+            *extra_args,
+        )
+    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise PatchError(
+            "container_unavailable",
+            f"Could not execute Docker for container {container}: {exc}",
+            path=path,
+        ) from exc
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(stdin),
+            timeout=PATCH_COMMAND_TIMEOUT_SEC + HOST_TIMEOUT_OVERHEAD_SEC,
+        )
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            await terminate_process(process)
+        raise
+    except asyncio.TimeoutError as exc:
+        if process.returncode is None:
+            await terminate_process(process)
+        raise PatchError(
+            "container_timeout",
+            f"Container patch operation timed out after {PATCH_COMMAND_TIMEOUT_SEC}s",
+            path=path,
+        ) from exc
+
+    assert process.returncode is not None
+    return _PatchCommandResult(
+        exit_code=process.returncode,
+        stdout=stdout,
+        stderr=stderr.decode("utf-8", errors="replace").strip(),
+    )
+
+
+def _patch_failure_message(operation: str, path: str, result: _PatchCommandResult) -> str:
+    detail = result.stderr or f"container command exited with code {result.exit_code}"
+    return f"Failed to {operation} {path}: {detail}"
+
+
+async def _read_patch_path(container: str, path: str) -> bytes | None:
+    result = await _run_patch_shell(container, _PATCH_READ, path)
+    if result.exit_code == 0:
+        return result.stdout
+    if result.exit_code == PATCH_MISSING_EXIT_CODE:
+        return None
+    if result.exit_code == PATCH_DIRECTORY_EXIT_CODE:
+        raise PatchError("path_is_directory", result.stderr, path=path)
+    raise PatchError("read_failed", _patch_failure_message("read", path, result), path=path)
+
+
+async def _prepare_patch(
+    container: str,
+    operations: tuple[FileOperation, ...],
+) -> tuple[_PreparedPatchOperation, ...]:
+    virtual_files: dict[str, bytes | None] = {}
+
+    async def read(path: str) -> bytes | None:
+        if path not in virtual_files:
+            virtual_files[path] = await _read_patch_path(container, path)
+        return virtual_files[path]
+
+    prepared: list[_PreparedPatchOperation] = []
+    for operation in operations:
+        path = operation.path
+        if operation.action == "add":
+            await read(path)
+            assert operation.contents is not None
+            content = operation.contents.encode("utf-8")
+            prepared.append(_PreparedPatchOperation("add", path, content=content))
+            virtual_files[path] = content
+            continue
+
+        if operation.action == "delete":
+            if await read(path) is None:
+                raise PatchError("file_not_found", "File to delete does not exist", path=path)
+            prepared.append(_PreparedPatchOperation("delete", path))
+            virtual_files[path] = None
+            continue
+
+        if operation.action != "update":
+            raise PatchError("invalid_patch", f"Unsupported patch action: {operation.action}")
+
+        original = await read(path)
+        if original is None:
+            raise PatchError("file_not_found", "File to update does not exist", path=path)
+        if operation.chunks:
+            try:
+                original_text = original.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise PatchError(
+                    "invalid_utf8",
+                    "File to update is not valid UTF-8 text",
+                    path=path,
+                ) from exc
+            new_content = apply_update(path, original_text, operation.chunks).encode("utf-8")
+        else:
+            new_content = original
+
+        move_path = operation.move_path
+        if move_path is not None and move_path != path:
+            await read(move_path)
+            prepared.append(
+                _PreparedPatchOperation(
+                    "move",
+                    path,
+                    content=new_content,
+                    move_path=move_path,
+                )
+            )
+            virtual_files[path] = None
+            virtual_files[move_path] = new_content
+        else:
+            prepared.append(_PreparedPatchOperation("update", path, content=new_content))
+            virtual_files[path] = new_content
+
+    return tuple(prepared)
+
+
+async def _write_patch_path(container: str, path: str, content: bytes) -> None:
+    result = await _run_patch_shell(
+        container,
+        _PATCH_WRITE,
+        path,
+        extra_args=(str(len(content)),),
+        stdin=content,
+    )
+    if result.exit_code == 0:
+        return
+    code = "path_is_directory" if result.exit_code == PATCH_DIRECTORY_EXIT_CODE else "write_failed"
+    raise PatchError(code, _patch_failure_message("write", path, result), path=path)
+
+
+async def _delete_patch_path(container: str, path: str) -> None:
+    result = await _run_patch_shell(container, _PATCH_DELETE, path)
+    if result.exit_code == 0:
+        return
+    code = "path_is_directory" if result.exit_code == PATCH_DIRECTORY_EXIT_CODE else "delete_failed"
+    raise PatchError(code, _patch_failure_message("delete", path, result), path=path)
+
+
+async def _commit_patch(
+    container: str,
+    operations: tuple[_PreparedPatchOperation, ...],
+) -> str:
+    applied: list[str] = []
+    try:
+        for operation in operations:
+            if operation.action in {"add", "update"}:
+                assert operation.content is not None
+                await _write_patch_path(container, operation.path, operation.content)
+                applied.append(f"{'A' if operation.action == 'add' else 'M'} {operation.path}")
+            elif operation.action == "delete":
+                await _delete_patch_path(container, operation.path)
+                applied.append(f"D {operation.path}")
+            elif operation.action == "move":
+                assert operation.content is not None
+                assert operation.move_path is not None
+                await _write_patch_path(container, operation.move_path, operation.content)
+                applied.append(f"A {operation.move_path} (move destination)")
+                await _delete_patch_path(container, operation.path)
+                applied[-1] = f"M {operation.path} -> {operation.move_path}"
+            else:
+                raise PatchError(
+                    "invalid_patch",
+                    f"Unsupported prepared action: {operation.action}",
+                    path=operation.path,
+                )
+    except PatchError as exc:
+        if not applied:
+            raise
+        completed = "\n".join(f"  {entry}" for entry in applied)
+        raise PatchError(
+            "partial_apply",
+            f"{exc.message}\nCompleted before the failure:\n{completed}",
+            path=exc.path,
+        ) from exc
+
+    return "Success. Updated the following files:\n" + "\n".join(applied)
+
+
+def _patch_lock_for(container: str) -> asyncio.Lock:
+    lock = _patch_locks.get(container)
+    if lock is None:
+        lock = asyncio.Lock()
+        _patch_locks[container] = lock
+    return lock
+
+
+async def apply_patch(patch: str, container: str) -> str:
+    """Apply a patch to an already validated container."""
+    async with _patch_lock_for(container):
+        operations = parse_patch(patch)
+        prepared = await _prepare_patch(container, operations)
+        with anyio.CancelScope(shield=True):
+            return await _commit_patch(container, prepared)
+
+
+async def dpatch(patch: str, container: str) -> str:
+    """Resolve the allowed container and apply a preflighted Codex patch."""
+    from . import server as runtime
+
+    return await apply_patch(patch, runtime.resolve_container(container))
