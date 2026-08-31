@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import socket
 import sys
 from pathlib import Path
 
@@ -9,34 +10,15 @@ import pytest
 from container_mcp import cli, dexec, server as runtime
 
 
-def test_cli_parses_source_runtime_options(tmp_path: Path) -> None:
-    args = cli._parse_args(
-        [
-            "--allow-container",
-            "simjoin",
-            "--runlog-dir",
-            str(tmp_path),
-            "serve",
-            "--port",
-            "19943",
-        ]
-    )
-
-    assert args.allow_container == ["simjoin"]
-    assert args.runlog_dir == str(tmp_path)
-    assert args.mode == "serve"
-    assert args.port == 19943
-
-
 def test_foreground_service_uses_configured_allowlist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[None] = []
+    socket_path = tmp_path / "container-mcp.sock"
+    calls: list[Path] = []
     monkeypatch.setattr(runtime, "RUNLOG_DIR", tmp_path)
     monkeypatch.setattr(runtime, "ALLOWED_CONTAINERS", frozenset())
-    monkeypatch.setattr(runtime, "run_http_server", lambda: calls.append(None))
-    monkeypatch.setattr(runtime.server.settings, "port", runtime.DEFAULT_HTTP_PORT)
+    monkeypatch.setattr(runtime, "run_uds_server", calls.append)
 
     cli.main(
         [
@@ -44,16 +26,40 @@ def test_foreground_service_uses_configured_allowlist(
             "simjoin",
             "--runlog-dir",
             str(tmp_path),
+            "--socket-path",
+            str(socket_path),
             "serve",
-            "--port",
-            "19943",
         ]
     )
 
-    assert calls == [None]
+    assert calls == [socket_path]
     assert runtime.ALLOWED_CONTAINERS == frozenset({"simjoin"})
     assert runtime.RUNLOG_DIR == tmp_path.resolve()
-    assert runtime.server.settings.port == 19943
+
+
+def test_default_mode_runs_stdio_proxy_without_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = tmp_path / "container-mcp.sock"
+    calls: list[Path] = []
+    monkeypatch.setattr(runtime, "ALLOWED_CONTAINERS", frozenset())
+    monkeypatch.setattr(runtime, "RUNLOG_DIR", runtime.DEFAULT_RUNLOG_DIR)
+    monkeypatch.setattr(cli, "run_stdio_proxy", calls.append)
+
+    cli.main(["--socket-path", str(socket_path)])
+
+    assert calls == [socket_path]
+
+
+def test_stale_socket_is_removed(tmp_path: Path) -> None:
+    socket_path = tmp_path / "container-mcp.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+        stale.bind(str(socket_path))
+
+    cli._remove_stale_socket(socket_path)
+
+    assert not socket_path.exists()
 
 
 def test_manual_exec_forwards_stdin_and_exit_code(
@@ -118,10 +124,12 @@ def test_detached_service_writes_repo_tmp_pid(
     monkeypatch.setattr(runtime, "ALLOWED_CONTAINERS", frozenset({"simjoin"}))
     monkeypatch.setattr(runtime, "RUNLOG_DIR", tmp_path / "RUNLOG")
     monkeypatch.setattr(cli, "_read_service_pid", lambda: None)
-    monkeypatch.setattr(cli, "_wait_for_service", lambda _port, _process: None)
+    monkeypatch.setattr(cli, "_wait_for_service", lambda _socket, _process: None)
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
 
-    assert cli._start_detached_service(9943) == 4321
+    socket_path = runtime_tmp / "container-mcp.sock"
+    assert cli._start_detached_service(socket_path) == 4321
     assert runtime.SERVICE_PID_PATH.read_text(encoding="utf-8") == "4321\n"
     assert command[:2] == [sys.executable, str(runtime.PROJECT_DIR / "run.py")]
-    assert command[-5:] == ["serve", "--host", "127.0.0.1", "--port", "9943"]
+    assert command[-3:] == ["--allow-container", "simjoin", "serve"]
+    assert command[command.index("--socket-path") + 1] == str(socket_path)

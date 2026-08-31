@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 import mcp.types as mcp_types
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from uvicorn.config import LOGGING_CONFIG
 
 
@@ -18,9 +20,9 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 TMP_DIR = PROJECT_DIR / "tmp"
 SERVICE_LOG_PATH = TMP_DIR / "container-mcp.log"
 SERVICE_PID_PATH = TMP_DIR / "container-mcp.pid"
+SERVICE_SOCKET_PATH = TMP_DIR / "container-mcp.sock"
 DEFAULT_RUNLOG_DIR = PROJECT_DIR / "RUNLOG"
-DEFAULT_HTTP_HOST = "127.0.0.1"
-DEFAULT_HTTP_PORT = 9943
+MCP_HTTP_URL = "http://container-mcp/mcp"
 MANUAL_RUN_ID = "manual"
 
 RUNLOG_DIR = DEFAULT_RUNLOG_DIR
@@ -31,6 +33,11 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S %z"
 
 
 def configure_runlog_dir(value: str) -> Path:
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else PROJECT_DIR / path).resolve()
+
+
+def configure_socket_path(value: str) -> Path:
     path = Path(value).expanduser()
     return (path if path.is_absolute() else PROJECT_DIR / path).resolve()
 
@@ -105,6 +112,7 @@ server = ContainerMCP(
         "Codex-style patches to absolute container paths. Complete dexec output is "
         "stored in RUNLOG; never assume a container protects the host."
     ),
+    transport_security=TransportSecuritySettings(allowed_hosts=["container-mcp"]),
 )
 
 
@@ -132,11 +140,19 @@ def uvicorn_log_config() -> dict[str, Any]:
     return log_config
 
 
-def run_http_server() -> None:
-    uvicorn.run(
-        server.streamable_http_app(),
-        host=server.settings.host,
-        port=server.settings.port,
-        log_level=server.settings.log_level.lower(),
-        log_config=uvicorn_log_config(),
-    )
+def run_uds_server(socket_path: Path) -> None:
+    socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if socket_path.parent == TMP_DIR:
+        socket_path.parent.chmod(0o700)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(socket_path))
+        try:
+            socket_path.chmod(0o600)
+            uvicorn.run(
+                server.streamable_http_app(),
+                fd=listener.fileno(),
+                log_level=server.settings.log_level.lower(),
+                log_config=uvicorn_log_config(),
+            )
+        finally:
+            socket_path.unlink(missing_ok=True)

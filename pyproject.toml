@@ -3,9 +3,11 @@ name = "container-mcp"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
+  "httpx==0.28.1",
   "mcp==1.28.1",
   # 2.15 emits an unresolved FastMCP lifespan warning during every CLI startup.
   "pydantic-settings==2.14.2",
+  "uvicorn==0.51.0",
 ]
 
 [dependency-groups]

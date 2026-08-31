@@ -3,8 +3,8 @@
 ## 模块
 
 - `run.py`：仓库源码入口。
-- `server.py`：FastMCP、白名单、服务日志和工具注册。
-- `cli.py`：前台、后台、状态、停止和人工执行命令。
+- `server.py`：FastMCP、白名单、UDS 服务、日志和工具注册。
+- `cli.py`：stdio 代理、前后台服务管理和人工执行命令。
 - `dexec.py`：命令执行、输出预览、超时清理和 RUNLOG。
 - `dinspect.py`：`docker inspect` 元信息。
 - `dpatch.py`：容器文件读写与 Codex patch 解析。
@@ -30,6 +30,7 @@
 
 ## 安全边界
 
-容器名在调用 Docker 前经过格式和 allowlist 校验。服务只绑定 loopback，但没有
-应用层认证。容器若处于 privileged 模式，或共享宿主机 namespace、设备和 bind
-mount，容器内操作仍可能影响宿主机，因此高风险操作前必须检查 `dinspect`。
+Codex 启动的 stdio 代理通过 HTTP over UDS 连接后台 FastMCP；socket 默认位于
+源码目录 `tmp/`，权限为 `0600`，不监听 TCP。容器名在调用 Docker 前经过格式和
+allowlist 校验。容器若处于 privileged 模式，或共享宿主机 namespace、设备和
+bind mount，容器内操作仍可能影响宿主机，因此高风险操作前必须检查 `dinspect`。

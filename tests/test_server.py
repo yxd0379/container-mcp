@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
+import stat
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -74,3 +77,30 @@ def test_uvicorn_logs_include_local_timestamp() -> None:
         assert formatter["datefmt"] == "%Y-%m-%d %H:%M:%S %z"
         assert formatter["fmt"].startswith("%(asctime)s ")
     assert log_config["root"] == {"handlers": ["default"], "level": "INFO"}
+
+
+def test_uds_server_uses_private_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = tmp_path / "state" / "container-mcp.sock"
+    app = object()
+
+    monkeypatch.setattr(runtime.server, "streamable_http_app", lambda: app)
+
+    def run(received_app: object, **kwargs: object) -> None:
+        assert received_app is app
+        assert "host" not in kwargs and "port" not in kwargs and "uds" not in kwargs
+        assert stat.S_IMODE(socket_path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
+        duplicate = socket.fromfd(int(kwargs["fd"]), socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            assert duplicate.getsockname() == str(socket_path)
+        finally:
+            duplicate.close()
+
+    monkeypatch.setattr(runtime.uvicorn, "run", run)
+
+    runtime.run_uds_server(socket_path)
+
+    assert not socket_path.exists()
